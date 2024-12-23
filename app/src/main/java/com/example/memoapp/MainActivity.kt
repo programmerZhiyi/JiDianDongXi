@@ -5,6 +5,8 @@ import android.os.Bundle
 import android.text.Editable
 import android.text.TextWatcher
 import android.util.Log
+import android.view.Menu
+import android.view.MenuItem
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
@@ -17,37 +19,37 @@ import com.example.memoapp.adapter.MemoAdapter
 import com.example.memoapp.data.Memo
 import com.example.memoapp.data.MemoDatabase
 import kotlinx.coroutines.launch
+import com.google.android.material.appbar.MaterialToolbar
 
 class MainActivity : AppCompatActivity() {
     private lateinit var memoAdapter: MemoAdapter
-    private lateinit var db: MemoDatabase
     private lateinit var recyclerView: RecyclerView
-    private lateinit var titleEditText: EditText
-    private lateinit var contentEditText: EditText
-    private lateinit var addButton: Button
+    private val undoStack = mutableListOf<UndoAction>()
+
+    // 定义撤回动作类型
+    sealed class UndoAction {
+        data class Delete(val memo: Memo) : UndoAction()
+        data class Add(val memo: Memo) : UndoAction()
+    }
 
     companion object {
         private const val TAG = "MainActivity"
+        private const val REQUEST_EDIT_MEMO = 1
+        private const val REQUEST_NEW_MEMO = 2
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
         try {
-            setContentView(R.layout.activity_main)
-
-            // 初始化视图
             initializeViews()
-
-            // 初始化数据库
-            initializeDatabase()
             
-            // 设置 RecyclerView
+            // 设置 Toolbar
+            val toolbar = findViewById<MaterialToolbar>(R.id.toolbar)
+            setSupportActionBar(toolbar)
+            
             setupRecyclerView()
-            
-            // 设置添加按钮
-            setupAddButton()
-            
-            // 加载数据
             loadMemos()
         } catch (e: Exception) {
             Log.e(TAG, "onCreate error: ${e.message}", e)
@@ -57,28 +59,33 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        // 清除适配器引用
         recyclerView.adapter = null
-        db.close()
+    }
+
+    override fun onCreateOptionsMenu(menu: Menu): Boolean {
+        menuInflater.inflate(R.menu.menu_main, menu)
+        return true
+    }
+
+    override fun onOptionsItemSelected(item: MenuItem): Boolean {
+        return when (item.itemId) {
+            R.id.action_new -> {
+                startNewMemo()
+                true
+            }
+            R.id.action_undo -> {
+                undo()
+                true
+            }
+            else -> super.onOptionsItemSelected(item)
+        }
     }
 
     private fun initializeViews() {
         try {
             recyclerView = findViewById(R.id.recyclerView)
-            titleEditText = findViewById(R.id.etTitle)
-            contentEditText = findViewById(R.id.etContent)
-            addButton = findViewById(R.id.btnAdd)
         } catch (e: Exception) {
             Log.e(TAG, "initializeViews error: ${e.message}", e)
-            throw e
-        }
-    }
-
-    private fun initializeDatabase() {
-        try {
-            db = MemoDatabase.getDatabase(applicationContext)
-        } catch (e: Exception) {
-            Log.e(TAG, "initializeDatabase error: ${e.message}", e)
             throw e
         }
     }
@@ -99,35 +106,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun setupAddButton() {
-        try {
-            addButton.setOnClickListener {
-                val title = titleEditText.text.toString().trim()
-                val content = contentEditText.text.toString().trim()
-                
-                when {
-                    title.isEmpty() -> showError("标题不能为空")
-                    content.isEmpty() -> showError("内容不能为空")
-                    else -> {
-                        addMemo(Memo(title = title, content = content))
-                        clearInputs()
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "setupAddButton error: ${e.message}", e)
-            showError("设置按钮失败: ${e.message}")
-        }
-    }
-
-    private fun clearInputs() {
-        titleEditText.text.clear()
-        contentEditText.text.clear()
+    private fun startNewMemo() {
+        val intent = Intent(this, MemoDetailActivity::class.java)
+        startActivityForResult(intent, REQUEST_NEW_MEMO)
     }
 
     private fun loadMemos() {
         lifecycleScope.launch {
             try {
+                val db = MemoDatabase.getDatabase(applicationContext)
                 val memos = db.memoDao().getAllMemos()
                 memoAdapter.submitList(memos)
             } catch (e: Exception) {
@@ -139,7 +126,9 @@ class MainActivity : AppCompatActivity() {
     private fun addMemo(memo: Memo) {
         lifecycleScope.launch {
             try {
+                val db = MemoDatabase.getDatabase(applicationContext)
                 db.memoDao().insert(memo)
+                undoStack.add(UndoAction.Add(memo))
                 loadMemos()
             } catch (e: Exception) {
                 showError("添加备忘录失败: ${e.message}")
@@ -150,7 +139,9 @@ class MainActivity : AppCompatActivity() {
     private fun deleteMemo(memo: Memo) {
         lifecycleScope.launch {
             try {
+                val db = MemoDatabase.getDatabase(applicationContext)
                 db.memoDao().delete(memo)
+                undoStack.add(UndoAction.Delete(memo))
                 loadMemos()
             } catch (e: Exception) {
                 showError("删除备忘录失败: ${e.message}")
@@ -160,14 +151,45 @@ class MainActivity : AppCompatActivity() {
 
     private fun openMemoDetail(memo: Memo) {
         val intent = Intent(this, MemoDetailActivity::class.java).apply {
+            putExtra(MemoDetailActivity.EXTRA_ID, memo.id)
             putExtra(MemoDetailActivity.EXTRA_TITLE, memo.title)
             putExtra(MemoDetailActivity.EXTRA_CONTENT, memo.content)
             putExtra(MemoDetailActivity.EXTRA_DATE, memo.createdAt.time)
         }
-        startActivity(intent)
+        startActivityForResult(intent, REQUEST_EDIT_MEMO)
     }
 
     private fun showError(message: String) {
         Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+    }
+
+    private fun undo() {
+        if (undoStack.isEmpty()) {
+            showError("没有可回的操作")
+            return
+        }
+
+        lifecycleScope.launch {
+            try {
+                val db = MemoDatabase.getDatabase(applicationContext)
+                when (val action = undoStack.removeLastOrNull()) {
+                    is UndoAction.Delete -> db.memoDao().insert(action.memo)
+                    is UndoAction.Add -> db.memoDao().delete(action.memo)
+                    null -> return@launch
+                }
+                loadMemos()
+                showError("已撤回上一步操作")
+            } catch (e: Exception) {
+                showError("撤回失败: ${e.message}")
+            }
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if ((requestCode == REQUEST_EDIT_MEMO || requestCode == REQUEST_NEW_MEMO) 
+            && resultCode == RESULT_OK) {
+            loadMemos()
+        }
     }
 }
